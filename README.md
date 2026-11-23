@@ -55,20 +55,22 @@ Copy-Item -Recurse "K:\PET\pokemon-pet-factory" "$HOME\.codex\skills\pokemon-pet
 你也可以在终端直接执行命令生成任意宝可梦：
 
 ```bash
-# 生成皮卡丘
+# 生成皮卡丘（默认 head 头部+眼神 3D 联动追踪）
 python scripts/generate_pokemon_pet.py --query "皮卡丘"
 
-# 生成伊布
-python scripts/generate_pokemon_pet.py --query "eevee"
-
-# 生成耿鬼
-python scripts/generate_pokemon_pet.py --query 94
+# 选择鼠标视线追踪模式：
+#   head : 身体静止，头部 3D 左右转头+俯仰+眼神联动（默认）
+#   eyes : 身体与头部静止，仅眼球/瞳孔/高光 16 向追踪
+#   all  : 同时生成『眼球追踪版』与『头部追踪版』两套桌宠包！
+#   body : 原版 8 方向全身转向
+python scripts/generate_pokemon_pet.py --query "杰尼龟" --look-style all
+python scripts/generate_pokemon_pet.py --query "耿鬼" --look-style eyes
 
 # 可选待机姿态：static（默认静止站姿）、sleep（打盹）、breathe（微呼吸）
 python scripts/generate_pokemon_pet.py --query "皮卡丘" --idle-style sleep
 
-# 仅检查 SpriteCollab 是否收录某只宝可梦
-python scripts/generate_pokemon_pet.py --query "索财灵" --check-only
+# 仅检查 SpriteCollab 是否收录某只宝可梦（同时检测是否含独立 Head-Anim 头部素材）
+python scripts/generate_pokemon_pet.py --query "杰尼龟" --check-only
 ```
 
 ---

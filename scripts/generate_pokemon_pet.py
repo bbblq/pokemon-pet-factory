@@ -29,11 +29,11 @@ import math
 import json
 import shutil
 import argparse
-import requests
+import urllib.request
+import urllib.error
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from PIL import Image, ImageDraw
-import numpy as np
 
 # Codex V2 Specifications
 COLUMNS = 8
@@ -122,22 +122,28 @@ def fetch_file(dex: str, filename: str, target_dir: Path) -> Path:
         return target_path
 
     url = f"{GITHUB_RAW_BASE}/{dex}/{filename}"
-    resp = requests.get(url, timeout=15)
-    if resp.status_code == 200:
-        with open(target_path, "wb") as f:
-            f.write(resp.content)
-        return target_path
-    elif resp.status_code == 404:
-        return None
-    else:
-        resp.raise_for_status()
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "pokemon-pet-factory/2.0"})
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status == 200:
+                target_path.write_bytes(resp.read())
+                return target_path
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return None
+        raise
+    return None
 
 
 def check_spritecollab_availability(dex: str) -> bool:
+    cached_xml = CACHE_DIR / f"pokemon_{dex}" / "AnimData.xml"
+    if cached_xml.exists() and cached_xml.stat().st_size > 0:
+        return True
     url = f"{GITHUB_RAW_BASE}/{dex}/AnimData.xml"
     try:
-        r = requests.head(url, timeout=5)
-        return r.status_code == 200
+        req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "pokemon-pet-factory/2.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            return resp.status == 200
     except Exception:
         return False
 
@@ -289,7 +295,397 @@ def build_cell(raw_crop: Image.Image,
     return cell
 
 
-def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale_mult: float = 1.0, idle_style: str = "static"):
+from collections import Counter
+
+
+def detect_eyes_generic(img_tight: Image.Image):
+    """Automatically detect symmetric left/right eye clusters and dominant face skin color on any front sprite."""
+    tw, th = img_tight.size
+    px = img_tight.load()
+    face_colors = []
+    for y in range(2, max(3, int(th * 0.7))):
+        for x in range(2, max(3, tw - 2)):
+            c = px[x, y]
+            if c[3] > 200 and c[:3] != (0, 0, 0) and not (c[0] > 240 and c[1] > 240 and c[2] > 240):
+                face_colors.append(c)
+    skin_color = Counter(face_colors).most_common(1)[0][0] if face_colors else (127, 207, 255, 255)
+
+    whites = []
+    for y in range(1, int(th * 0.72)):
+        for x in range(1, tw - 1):
+            r, g, b, a = px[x, y]
+            if a > 200 and r > 235 and g > 235 and b > 235:
+                whites.append((x, y))
+
+    mid = (tw - 1) / 2.0
+    left_w = [(x, y) for x, y in whites if 1 <= x < mid - 0.2]
+    right_w = [(x, y) for x, y in whites if mid + 0.2 < x <= tw - 2]
+    if not left_w or not right_w:
+        return skin_color, None
+
+    best_pair = None
+    best_score = 999.0
+    for lx, ly in left_w:
+        for rx, ry in right_w:
+            if abs(ly - ry) <= 1:
+                sym_err = abs((mid - lx) - (rx - mid)) + abs(ly - ry) * 2
+                if sym_err < best_score:
+                    best_score = sym_err
+                    best_pair = ((lx, ly), (rx, ry))
+    if not best_pair:
+        return skin_color, None
+
+    eyes = []
+    for sx, sy in best_pair:
+        visited = set([(sx, sy)])
+        queue = [(sx, sy)]
+        while queue:
+            cx, cy = queue.pop(0)
+            for dx, dy in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
+                nx, ny = cx + dx, cy + dy
+                if 1 <= nx < tw - 1 and 1 <= ny < int(th * 0.78) and (nx, ny) not in visited:
+                    if abs(nx - sx) <= 2 and abs(ny - sy) <= 2:
+                        c = px[nx, ny]
+                        is_outer = (
+                            nx <= 1
+                            or nx >= tw - 2
+                            or ny <= 1
+                            or px[nx - 1, ny][3] == 0
+                            or px[nx + 1, ny][3] == 0
+                            or px[nx, ny - 1][3] == 0
+                        )
+                        if c[3] > 200 and c != skin_color and not (c[:3] == (0, 0, 0) and is_outer):
+                            visited.add((nx, ny))
+                            queue.append((nx, ny))
+        ex0 = min(x for x, _ in visited)
+        ey0 = min(y for _, y in visited)
+        ex1 = max(x for x, _ in visited) + 1
+        ey1 = max(y for _, y in visited) + 1
+        eyes.append((ex0, ey0, ex1, ey1, visited))
+    return skin_color, eyes
+
+
+def apply_eye_shift_to_scaled(raw_img: Image.Image, scale: int, dx: float, dy: float) -> Image.Image:
+    """Shift detected eye clusters and catchlights on an integer-scaled sprite."""
+    s = max(1, round(scale))
+    tw, th = raw_img.size
+    scaled = raw_img.resize((tw * s, th * s), Image.Resampling.NEAREST)
+    skin_color, eyes = detect_eyes_generic(raw_img)
+    if not eyes:
+        return scaled
+    draw = ImageDraw.Draw(scaled)
+    px = raw_img.load()
+    ox = round(dx * (s * 0.65))
+    oy = round(dy * (s * 0.65))
+    hx = round(dx * (s * 0.45))
+    hy = round(dy * (s * 0.45))
+
+    eye_layers = []
+    for ex0, ey0, ex1, ey1, visited in eyes:
+        non_white = []
+        white_pts = []
+        for (x, y) in visited:
+            c = px[x, y]
+            if c[0] > 235 and c[1] > 235 and c[2] > 235:
+                white_pts.append((x, y, c))
+            else:
+                non_white.append((x, y, c))
+            draw.rectangle([x * s, y * s, (x + 1) * s - 1, (y + 1) * s - 1], fill=skin_color)
+        eye_layers.append((non_white, white_pts))
+
+    for non_white, white_pts in eye_layers:
+        for x, y, c in non_white:
+            draw.rectangle([x * s + ox, y * s + oy, (x + 1) * s - 1 + ox, (y + 1) * s - 1 + oy], fill=c)
+        for x, y, c in white_pts:
+            draw.rectangle(
+                [x * s + ox + hx, y * s + oy + hy, (x + 1) * s - 1 + ox + hx, (y + 1) * s - 1 + oy + hy],
+                fill=c,
+            )
+    return scaled
+
+
+def render_universal_eyes_cell(front_raw: Image.Image, scale: float, baseline_y: int, deg: float, dex: str = None) -> Image.Image:
+    """Render stationary body with 16-direction animated eye/pupil tracking for any Pokémon."""
+    if dex == "0007":
+        return render_squirtle_eyes_cell(front_raw, scale=scale, baseline_y=baseline_y, deg=deg)
+
+    cell = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    bbox = front_raw.getbbox()
+    if bbox is None:
+        return cell
+    ft = front_raw.crop(bbox)
+    s = max(1, round(scale))
+    rad = math.radians(deg)
+    dx = math.sin(rad)
+    dy = -math.cos(rad)
+
+    scaled = apply_eye_shift_to_scaled(ft, s, dx, dy)
+    cx = CELL_WIDTH // 2
+    py = max(2, baseline_y - scaled.height)
+    cell.paste(scaled, (cx - scaled.width // 2, py), scaled)
+    return cell
+
+
+def render_universal_head_cell(
+    front_raw: Image.Image,
+    head_sheet: Image.Image,
+    head_info: dict,
+    scale: float,
+    baseline_y: int,
+    deg: float,
+    dex: str = None,
+) -> Image.Image:
+    """Render stationary lower-body with continuous bottom-anchored head/upper-body lean & pitch + eye tracking."""
+    if dex == "0007" and head_sheet is not None:
+        return render_squirtle_head_cell(front_raw, head_sheet=head_sheet, scale=scale, baseline_y=baseline_y, deg=deg)
+
+    cell = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    bbox = front_raw.getbbox()
+    if bbox is None:
+        return cell
+    ft = front_raw.crop(bbox)
+    s = max(1, round(scale))
+    rad = math.radians(deg)
+    dx = math.sin(rad)   # +1 screen-right, -1 screen-left
+    dy = -math.cos(rad)  # -1 screen-up, +1 screen-down
+
+    base_scaled = apply_eye_shift_to_scaled(ft, s, dx, dy)
+    nw, nh = base_scaled.size
+
+    # Continuous bottom-anchored upper-body/head lean & vertical pitch:
+    # Lower 28% (feet/legs) stays 100% anchored on the ground;
+    # Upper 72% smoothly leans horizontally and pitches vertically without ever severing the neck, ears, or tail.
+    pad = 16
+    comp = Image.new("RGBA", (nw + pad * 2, nh + pad * 2), (0, 0, 0, 0))
+    anchor_y = int(nh * 0.72)
+
+    for y in range(nh):
+        if y >= anchor_y:
+            shift_x = 0
+            src_y = y
+        else:
+            t = (anchor_y - y) / max(1.0, float(anchor_y))
+            shift_x = round(dx * (s * 0.85) * t)
+            shift_y = round(dy * (s * 0.65) * t)
+            src_y = max(0, min(anchor_y - 1, y - shift_y))
+        row_strip = base_scaled.crop((0, src_y, nw, src_y + 1))
+        comp.paste(row_strip, (pad + shift_x, pad + y), row_strip)
+
+    cx = CELL_WIDTH // 2
+    py = max(2, baseline_y - nh - pad)
+    cell.paste(comp, (cx - nw // 2 - pad, py), comp)
+    return cell
+
+
+def render_squirtle_eyes_cell(front_raw: Image.Image, scale: float, baseline_y: int, deg: float) -> Image.Image:
+    """Render Squirtle (#0007) with stationary body and 16-direction animated eye/pupil tracking."""
+    cell = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    bbox = front_raw.getbbox()
+    if bbox is None:
+        return cell
+    front_tight = front_raw.crop(bbox)
+    tw, th = front_tight.size
+    s = max(1, round(scale))
+    nw, nh = tw * s, th * s
+    scaled = front_tight.resize((nw, nh), Image.Resampling.NEAREST)
+    draw = ImageDraw.Draw(scaled)
+
+    rad = math.radians(deg)
+    dx = math.sin(rad)   # +1 screen-right, -1 screen-left
+    dy = -math.cos(rad)  # -1 screen-up, +1 screen-down
+
+    ox = round(dx * (s * 0.72))
+    oy = round(dy * (s * 0.72))
+    px_shift = round(dx * (s * 0.6))
+    py_shift = round(dy * (s * 0.6))
+
+    skin = (0x7F, 0xCF, 0xFF, 255)
+    brow = (0x1F, 0x9F, 0xE7, 255)
+    crimson = (0x9F, 0x00, 0x00, 255)
+    coral = (0xFF, 0x87, 0x5F, 255)
+    black = (0x00, 0x00, 0x00, 255)
+    white = (0xFF, 0xFF, 0xFF, 255)
+
+    # Clear original eyes (x=4..5, y=5..7 and x=11..12, y=5..7) and brow pixels (x=5,11, y=4)
+    draw.rectangle([4 * s, 5 * s, 6 * s - 1, 8 * s - 1], fill=skin)
+    draw.rectangle([11 * s, 5 * s, 13 * s - 1, 8 * s - 1], fill=skin)
+    draw.rectangle([5 * s, 4 * s, 6 * s - 1, 5 * s - 1], fill=skin)
+    draw.rectangle([11 * s, 4 * s, 12 * s - 1, 5 * s - 1], fill=skin)
+
+    ew, eh = 2 * s, 3 * s
+    pw, ph = max(4, round(1.15 * s)), max(6, round(1.55 * s))
+    hw, hh = max(3, round(0.85 * s)), max(3, round(0.85 * s))
+
+    for ex_base in (4 * s, 11 * s):
+        ex = ex_base + ox
+        ey = 5 * s + oy
+        draw.rectangle([ex + 2, ey - 3, ex + ew - 3, ey - 1], fill=brow)
+        draw.rectangle([ex, ey, ex + ew - 1, ey + eh - 1], fill=crimson)
+        draw.rectangle([ex + 1, ey + eh - s + 1, ex + ew - 2, ey + eh - 1], fill=coral)
+
+        pcx = ex + ew // 2 + px_shift
+        pcy = ey + eh // 2 + py_shift
+        p_left = max(ex + 1, min(ex + ew - pw - 1, pcx - pw // 2))
+        p_top = max(ey + 1, min(ey + eh - ph - 1, pcy - ph // 2))
+        draw.rectangle([p_left, p_top, p_left + pw - 1, p_top + ph - 1], fill=black)
+
+        hl_left = max(ex + 1, min(ex + ew - hw - 1, p_left + (pw - hw if dx >= 0 else 0)))
+        hl_top = max(ey + 1, min(ey + eh - hh - 1, p_top - 2 if dy <= 0 else p_top + ph - hh))
+        draw.rectangle([hl_left, hl_top, hl_left + hw - 1, hl_top + hh - 1], fill=white)
+
+    cx = CELL_WIDTH // 2
+    py = max(2, baseline_y - nh)
+    cell.paste(scaled, (cx - nw // 2, py), scaled)
+    return cell
+
+
+def render_squirtle_head_cell(front_raw: Image.Image, head_sheet: Image.Image, scale: float, baseline_y: int, deg: float) -> Image.Image:
+    """Render Squirtle (#0007) with anchored front body and 16-direction 3D head turn/pitch/tilt."""
+    cell = Image.new("RGBA", (CELL_WIDTH, CELL_HEIGHT), (0, 0, 0, 0))
+    bbox = front_raw.getbbox()
+    if bbox is None:
+        return cell
+    front_tight = front_raw.crop(bbox)
+    tw, th = front_tight.size
+    s = max(1, round(scale))
+    nw, nh = tw * s, th * s
+
+    # Extract headless body from front_tight (17x18)
+    body_only = front_tight.copy()
+    b_px = body_only.load()
+    for y in range(min(11, th)):
+        for x in range(tw):
+            if y < 9:
+                b_px[x, y] = (0, 0, 0, 0)
+            elif y == 9 and 4 <= x <= 12:
+                b_px[x, y] = (0, 0, 0, 0)
+            elif y == 10 and 5 <= x <= 11:
+                b_px[x, y] = (0x00, 0x67, 0xB7, 255) if x in (5, 11) else (0xDF, 0xAF, 0x67, 255)
+
+    body_scaled = body_only.resize((nw, nh), Image.Resampling.NEAREST)
+
+    rad = math.radians(deg)
+    dx = math.sin(rad)   # +1 screen-right, -1 screen-left
+    dy = -math.cos(rad)  # -1 screen-up, +1 screen-down
+
+    if head_sheet is not None and dx >= 0.35:
+        h_raw = head_sheet.crop((0, 1 * 32, 24, 2 * 32)).crop((6, 1, 19, 13))
+        head_type = "right"
+    elif head_sheet is not None and dx <= -0.35:
+        h_raw = head_sheet.crop((0, 7 * 32, 24, 8 * 32)).crop((4, 1, 17, 13))
+        head_type = "left"
+    elif head_sheet is not None:
+        h_raw = head_sheet.crop((0, 0 * 32, 24, 1 * 32)).crop((5, 1, 18, 13))
+        head_type = "front"
+    else:
+        h_raw = front_tight.crop((2, 0, 15, 11))
+        head_type = "front"
+
+    hw_orig, hh_orig = h_raw.size
+    head_scaled = h_raw.resize((hw_orig * s, hh_orig * s), Image.Resampling.NEAREST)
+    draw_h = ImageDraw.Draw(head_scaled)
+
+    skin = (0x7F, 0xCF, 0xFF, 255)
+    brow = (0x1F, 0x9F, 0xE7, 255)
+    crimson = (0x9F, 0x00, 0x00, 255)
+    coral = (0xFF, 0x87, 0x5F, 255)
+    black = (0x00, 0x00, 0x00, 255)
+    white = (0xFF, 0xFF, 0xFF, 255)
+
+    ew, eh = 2 * s, 3 * s
+    pw, ph = max(4, round(1.15 * s)), max(6, round(1.55 * s))
+    hw_hl, hh_hl = max(3, round(0.85 * s)), max(3, round(0.85 * s))
+
+    if head_type == "front":
+        draw_h.rectangle([2 * s, 4 * s, 4 * s - 1, 8 * s - 1], fill=skin)
+        draw_h.rectangle([9 * s, 4 * s, 11 * s - 1, 8 * s - 1], fill=skin)
+        draw_h.rectangle([5 * s, 8 * s, 8 * s - 1, 9 * s - 1], fill=skin)
+
+        ox = round(dx * (s * 0.7))
+        oy = round(dy * (s * 0.7))
+        px_s = round(dx * (s * 0.55))
+        py_s = round(dy * (s * 0.55))
+
+        for ex_b in (2 * s, 9 * s):
+            ex = ex_b + ox
+            ey = 5 * s + oy
+            draw_h.rectangle([ex + 2, ey - 3, ex + ew - 3, ey - 1], fill=brow)
+            draw_h.rectangle([ex, ey, ex + ew - 1, ey + eh - 1], fill=crimson)
+            draw_h.rectangle([ex + 1, ey + eh - s + 1, ex + ew - 2, ey + eh - 1], fill=coral)
+            pcx, pcy = ex + ew // 2 + px_s, ey + eh // 2 + py_s
+            pl = max(ex + 1, min(ex + ew - pw - 1, pcx - pw // 2))
+            pt = max(ey + 1, min(ey + eh - ph - 1, pcy - ph // 2))
+            draw_h.rectangle([pl, pt, pl + pw - 1, pt + ph - 1], fill=black)
+            hl = max(ex + 1, min(ex + ew - hw_hl - 1, pl + (pw - hw_hl if dx >= 0 else 0)))
+            ht = max(ey + 1, min(ey + eh - hh_hl - 1, pt - 2 if dy <= 0 else pt + ph - hh_hl))
+            draw_h.rectangle([hl, ht, hl + hw_hl - 1, ht + hh_hl - 1], fill=white)
+
+        ny = 8 * s + round(dy * (s * 0.55))
+        nx1, nx2 = 5 * s + ox, 7 * s + ox
+        draw_h.rectangle([nx1, ny, nx1 + s - 1, ny + s - 1], fill=brow)
+        draw_h.rectangle([nx2, ny, nx2 + s - 1, ny + s - 1], fill=brow)
+
+    elif head_type == "right":
+        draw_h.rectangle([4 * s, 4 * s, 6 * s - 1, 8 * s - 1], fill=skin)
+        draw_h.rectangle([9 * s, 4 * s, 11 * s - 1, 7 * s - 1], fill=skin)
+        oy = round(dy * (s * 0.55))
+        py_s = round(dy * (s * 0.55))
+        ex, ey = 4 * s + round(dx * 2), 5 * s + oy
+        draw_h.rectangle([ex + 2, ey - 3, ex + ew - 3, ey - 1], fill=brow)
+        draw_h.rectangle([ex, ey, ex + ew - 1, ey + eh - 1], fill=crimson)
+        draw_h.rectangle([ex + 1, ey + eh - s + 1, ex + ew - 2, ey + eh - 1], fill=coral)
+        pl, pt = ex + ew - pw - 1, max(ey + 1, min(ey + eh - ph - 1, ey + (eh - ph) // 2 + py_s))
+        draw_h.rectangle([pl, pt, pl + pw - 1, pt + ph - 1], fill=black)
+        ht = max(ey + 1, min(ey + eh - hh_hl - 1, pt - 2 if dy <= 0 else pt + ph - hh_hl))
+        draw_h.rectangle([pl + pw - hw_hl, ht, pl + pw - 1, ht + hh_hl - 1], fill=white)
+
+        fx, fy, fw_e, fh_e = 10 * s, 4 * s + oy, s, 3 * s
+        draw_h.rectangle([fx, fy, fx + fw_e - 1, fy + fh_e - 1], fill=crimson)
+        pt_f = max(fy + 1, min(fy + fh_e - ph + 1, fy + (fh_e - ph) // 2 + py_s))
+        draw_h.rectangle([fx + 1, pt_f, fx + fw_e - 1, pt_f + ph - 3], fill=black)
+        ht_f = max(fy, min(fy + fh_e - hh_hl, pt_f - 2 if dy <= 0 else pt_f + 4))
+        draw_h.rectangle([fx + 1, ht_f, fx + fw_e - 1, ht_f + hh_hl - 2], fill=white)
+
+    elif head_type == "left":
+        draw_h.rectangle([2 * s, 4 * s, 4 * s - 1, 7 * s - 1], fill=skin)
+        draw_h.rectangle([7 * s, 4 * s, 9 * s - 1, 8 * s - 1], fill=skin)
+        oy = round(dy * (s * 0.55))
+        py_s = round(dy * (s * 0.55))
+        ex, ey = 7 * s + round(dx * 2), 5 * s + oy
+        draw_h.rectangle([ex + 2, ey - 3, ex + ew - 3, ey - 1], fill=brow)
+        draw_h.rectangle([ex, ey, ex + ew - 1, ey + eh - 1], fill=crimson)
+        draw_h.rectangle([ex + 1, ey + eh - s + 1, ex + ew - 2, ey + eh - 1], fill=coral)
+        pl, pt = ex + 1, max(ey + 1, min(ey + eh - ph - 1, ey + (eh - ph) // 2 + py_s))
+        draw_h.rectangle([pl, pt, pl + pw - 1, pt + ph - 1], fill=black)
+        ht = max(ey + 1, min(ey + eh - hh_hl - 1, pt - 2 if dy <= 0 else pt + ph - hh_hl))
+        draw_h.rectangle([pl, ht, pl + hw_hl - 1, ht + hh_hl - 1], fill=white)
+
+        fx, fy, fw_e, fh_e = 2 * s, 4 * s + oy, s, 3 * s
+        draw_h.rectangle([fx, fy, fx + fw_e - 1, fy + fh_e - 1], fill=crimson)
+        pt_f = max(fy + 1, min(fy + fh_e - ph + 1, fy + (fh_e - ph) // 2 + py_s))
+        draw_h.rectangle([fx, pt_f, fx + fw_e - 2, pt_f + ph - 3], fill=black)
+        ht_f = max(fy, min(fy + fh_e - hh_hl, pt_f - 2 if dy <= 0 else pt_f + 4))
+        draw_h.rectangle([fx, ht_f, fx + fw_e - 2, ht_f + hh_hl - 2], fill=white)
+
+    tilt = -dx * 7.0
+    if abs(tilt) > 1.0:
+        head_scaled = head_scaled.rotate(tilt, resample=Image.Resampling.NEAREST, expand=False)
+
+    hx = 2 * s + round(dx * (s * 1.15))
+    hy = round(dy * (s * 1.0))
+
+    ox_pad, oy_pad = 16, 16
+    comp = Image.new("RGBA", (nw + ox_pad * 2, nh + oy_pad * 2), (0, 0, 0, 0))
+    comp.paste(body_scaled, (ox_pad, oy_pad), body_scaled)
+    comp.paste(head_scaled, (ox_pad + hx, oy_pad + hy), head_scaled)
+
+    cx = CELL_WIDTH // 2
+    py = max(2, baseline_y - nh - oy_pad)
+    cell.paste(comp, (cx - nw // 2 - ox_pad, py), comp)
+    return cell
+
+
+def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale_mult: float = 1.0, idle_style: str = "static", look_style: str = "head"):
     atlas = Image.new("RGBA", (ATLAS_WIDTH, ATLAS_HEIGHT), (0, 0, 0, 0))
 
     # Helper to load animation sheets
@@ -305,6 +701,8 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
     pose_sheet = load_sheet("Pose") or load_sheet("Nod") or hop_sheet
     rotate_sheet = load_sheet("Rotate") or walk_sheet
     attack_sheet = load_sheet("Attack") or load_sheet("Charge") or walk_sheet
+    head_sheet = load_sheet("Head")
+    head_info = anims.get("Head")
 
     # Calculate optimal display scale from standard Walk frame
     walk_info = anims.get("Walk", {"fw": 32, "fh": 40})
@@ -335,10 +733,13 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
         return crop_frame(sheet, safe_col, safe_row, fw, fh)
 
     # ----------------------------------------------------
-    # Row 0: Idle (6 frames, calm by default)
+    # Row 0: Idle (6 frames in cols 0..5, plus EXTENDED_NEUTRAL_LOOK_FRAME in col 6!)
     # ----------------------------------------------------
     idle_info = anims.get("Idle", walk_info)
     idle_frames = max(1, idle_info["frames"])
+    front_neutral_raw = get_frame(idle_sheet, "Idle", 0, 0)
+    neutral_cell = build_cell(front_neutral_raw, scale=scale, baseline_y=baseline, lift_y=0)
+
     if idle_style == "sleep" and "Sleep" in anims and sleep_sheet is not None:
         sleep_frames = max(1, anims["Sleep"]["frames"])
         for c in range(6):
@@ -347,15 +748,15 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
             atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
     elif idle_style == "breathe":
         breathe_lifts = [0, 0, 1, 1, 0, 0]
-        raw = get_frame(idle_sheet, "Idle", 0, 0)
         for c in range(6):
-            cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=breathe_lifts[c])
+            cell = build_cell(front_neutral_raw, scale=scale, baseline_y=baseline, lift_y=breathe_lifts[c])
             atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
     else:
-        raw = get_frame(idle_sheet, "Idle", 0, 0)
         for c in range(6):
-            cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=0)
-            atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
+            atlas.paste(neutral_cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), neutral_cell)
+
+    # Codex V2 Contract: Row 0, Column 6 MUST be populated as EXTENDED_NEUTRAL_LOOK_FRAME = (0, 6)
+    atlas.paste(neutral_cell, (6 * CELL_WIDTH, 0 * CELL_HEIGHT), neutral_cell)
 
     # ----------------------------------------------------
     # Row 1: Running-Right (8 frames, facing East / row 2)
@@ -367,10 +768,9 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
         atlas.paste(cell, (c * CELL_WIDTH, 1 * CELL_HEIGHT), cell)
 
     # ----------------------------------------------------
-    # Row 2: Running-Left (8 frames, facing West / row 6, or flipped row 2)
+    # Row 2: Running-Left (8 frames, facing West / row 6)
     # ----------------------------------------------------
     for c in range(8):
-        # Dir 6 is West
         raw = get_frame(walk_sheet, "Walk", c % walk_cols, 6)
         cell = build_cell(raw, scale=scale, baseline_y=baseline)
         atlas.paste(cell, (c * CELL_WIDTH, 2 * CELL_HEIGHT), cell)
@@ -411,10 +811,14 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
 
     # ----------------------------------------------------
     # Row 6: Waiting (6 frames, curious turn/look around)
+    # Note: In PMD Rotate-Anim.png, row 0 cols 0..7 are the 8 directions (0:S, 1:SE, 2:E, 3:NE, 4:N, 5:NW, 6:W, 7:SW)
     # ----------------------------------------------------
-    wait_dirs = [0, 7, 6, 0, 1, 2] # front, down-left, left, front, down-right, right
+    wait_dirs = [0, 7, 6, 0, 1, 2]
     for c in range(6):
-        raw = get_frame(rotate_sheet, "Rotate", 0, wait_dirs[c])
+        if "Rotate" in anims and rotate_sheet is not None:
+            raw = get_frame(rotate_sheet, "Rotate", wait_dirs[c], 0)
+        else:
+            raw = get_frame(walk_sheet, "Walk", 0, wait_dirs[c])
         cell = build_cell(raw, scale=scale, baseline_y=baseline)
         atlas.paste(cell, (c * CELL_WIDTH, 6 * CELL_HEIGHT), cell)
 
@@ -471,96 +875,87 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
         atlas.paste(cell, (c * CELL_WIDTH, 8 * CELL_HEIGHT), cell)
 
     # ----------------------------------------------------
-    # Row 9 & 10: 16 Gaze Directions (8 frames each)
+    # Row 9 & 10: 16 Gaze Directions (8 frames each, clockwise from 000=UP)
     # ----------------------------------------------------
-    # Direction map for 16 angles (0..15)
-    # PMD 8-dirs: 0:S, 1:SE, 2:E, 3:NE, 4:N, 5:NW, 6:W, 7:SW
+    # PMD Rotate-Anim row 0 cols 0..7: 0:S(down), 1:SE(down-right), 2:E(right), 3:NE(up-right),
+    #                                  4:N(up),   5:NW(up-left),    6:W(left),  7:SW(down-left)
     dir16_to_pmd = [
-        (4, 0.0),    # 000: N
+        (4, 0.0),    # 000: N (Up)
         (3, -4.0),   # 022.5: NNE
-        (3, 0.0),    # 045: NE
+        (3, 0.0),    # 045: NE (Up-Right)
         (2, -4.0),   # 067.5: ENE
-        (2, 0.0),    # 090: E
+        (2, 0.0),    # 090: E (Right)
         (1, -4.0),   # 112.5: ESE
-        (1, 0.0),    # 135: SE
+        (1, 0.0),    # 135: SE (Down-Right)
         (0, -4.0),   # 157.5: SSE
-        (0, 0.0),    # 180: S
+        (0, 0.0),    # 180: S (Down)
         (0, 4.0),    # 202.5: SSW
-        (7, 0.0),    # 225: SW
+        (7, 0.0),    # 225: SW (Down-Left)
         (6, 4.0),    # 247.5: WSW
-        (6, 0.0),    # 270: W
+        (6, 0.0),    # 270: W (Left)
         (5, 4.0),    # 292.5: WNW
-        (5, 0.0),    # 315: NW
+        (5, 0.0),    # 315: NW (Up-Left)
         (4, 4.0),    # 337.5: NNW
     ]
 
     for idx, (pmd_dir, tilt) in enumerate(dir16_to_pmd):
         target_row = 9 if idx < 8 else 10
         target_col = idx % 8
-        raw = get_frame(rotate_sheet, "Rotate", 0, pmd_dir)
-        cell = build_cell(raw, scale=scale, baseline_y=baseline, tilt_deg=tilt)
+        deg = idx * 22.5
+
+        if look_style == "eyes":
+            cell = render_universal_eyes_cell(front_neutral_raw, scale=scale, baseline_y=baseline, deg=deg, dex=dex)
+        elif look_style == "head":
+            cell = render_universal_head_cell(
+                front_neutral_raw,
+                head_sheet=head_sheet,
+                head_info=head_info,
+                scale=scale,
+                baseline_y=baseline,
+                deg=deg,
+                dex=dex,
+            )
+        else:
+            if "Rotate" in anims and rotate_sheet is not None:
+                raw = get_frame(rotate_sheet, "Rotate", pmd_dir, 0)
+            else:
+                raw = get_frame(walk_sheet, "Walk", 0, pmd_dir)
+            cell = build_cell(raw, scale=scale, baseline_y=baseline, tilt_deg=tilt)
+
         atlas.paste(cell, (target_col * CELL_WIDTH, target_row * CELL_HEIGHT), cell)
 
     return atlas
 
 
 def clean_alpha_residues(img: Image.Image) -> Image.Image:
-    arr = np.array(img)
-    alpha = arr[:, :, 3]
-    zero_mask = (alpha == 0)
-    arr[zero_mask, 0] = 0
-    arr[zero_mask, 1] = 0
-    arr[zero_mask, 2] = 0
-    return Image.fromarray(arr, mode="RGBA")
+    rgba = img.convert("RGBA")
+    data = bytearray(rgba.tobytes())
+    for i in range(0, len(data), 4):
+        if data[i + 3] == 0:
+            data[i] = 0
+            data[i + 1] = 0
+            data[i + 2] = 0
+    return Image.frombytes("RGBA", rgba.size, bytes(data))
 
 
-def generate_pet_json(pokemon: dict) -> dict:
-    pet_id = pokemon["en"].lower().replace(" ", "-")
-    display_name = f"{pokemon.get('zh_hans', pokemon['en'])} ({pokemon['en']})"
+def generate_pet_json(pokemon: dict, custom_id: str = None, custom_name: str = None) -> dict:
+    pet_id = custom_id or pokemon["en"].lower().replace(" ", "-")
+    display_name = custom_name or f"{pokemon.get('zh_hans', pokemon['en'])} ({pokemon['en']})"
     desc = f"Official-quality animated AI companion pet based on {pokemon['en']} from Pokémon Mystery Dungeon (SpriteCollab)."
-
-    states = {}
-    for cfg in ROW_CONFIG:
-        state_name = cfg["state"]
-        row = cfg["row"]
-        frames_count = cfg["frames"]
-        durations = cfg["durations"]
-        states[state_name] = {
-            "row": row,
-            "columns": frames_count,
-            "frameDuration": durations[0] if len(set(durations)) == 1 else durations
-        }
 
     return {
         "id": pet_id,
-        "slug": pet_id,
-        "petId": pet_id,
-        "name": display_name,
         "displayName": display_name,
         "description": desc,
-        "spritesheetPath": "spritesheet.webp",
-        "author": "Antigravity & PMDCollab Community",
-        "license": "CC-BY-NC 4.0 / Fan Work",
         "spriteVersionNumber": 2,
-        "atlasWidth": ATLAS_WIDTH,
-        "atlasHeight": ATLAS_HEIGHT,
-        "frameWidth": CELL_WIDTH,
-        "frameHeight": CELL_HEIGHT,
-        "cellWidth": CELL_WIDTH,
-        "cellHeight": CELL_HEIGHT,
-        "gridColumns": COLUMNS,
-        "gridRows": ROWS,
-        "columns": COLUMNS,
-        "rows": ROWS,
-        "states": states,
-        "lookDirectionLabels": LOOK_DIRECTION_LABELS
+        "spritesheetPath": "spritesheet.webp"
     }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Universal Pokémon Agent Pet Generator")
     parser.add_argument("--query", "-q", required=True, help="Pokémon name (Chinese/English) or Dex ID (e.g. 25, pikachu, 皮卡丘)")
-    parser.add_argument("--check-only", action="store_true", help="Only check if available in SpriteCollab, do not build")
+    parser.add_argument("--check-only", action="store_true", help="Only check if available in SpriteCollab and inspect supported look styles")
     parser.add_argument("--dest", "-d", default=None, help="Destination directory for pet (defaults to ~/.codex/pets/<id>)")
     parser.add_argument("--scale-mult", type=float, default=1.0, help="Scale multiplier for character size (default: 1.0)")
     parser.add_argument(
@@ -569,6 +964,14 @@ def main():
         default="static",
         help="Idle animation style: static (standing still, default), sleep (Sleep-Anim), or breathe (subtle 1px lift)"
     )
+    parser.add_argument(
+        "--look-style",
+        choices=["eyes", "head", "body", "all"],
+        default="head",
+        help="16-direction mouse tracking style: eyes (moving pupils), head (turning/tilting head + eyes, default), body (8-dir full body turn), or all (generate both eyes & head variants)"
+    )
+    parser.add_argument("--pet-id", default=None, help="Custom pet ID / folder slug")
+    parser.add_argument("--display-name", default=None, help="Custom display name in pet.json")
     args = parser.parse_args()
 
     # 1. Look up in Pokédex DB
@@ -598,20 +1001,8 @@ def main():
         print(json.dumps(res, ensure_ascii=False, indent=2))
         sys.exit(2)
 
-    if args.check_only:
-        res = {
-            "status": "AVAILABLE",
-            "pokemon": pokemon,
-            "message": f"SpriteCollab 拥有【{name_zh}】(#{dex} {name_en}) 的完整官方级逐帧动作素材，可以随时生成！"
-        }
-        print(json.dumps(res, ensure_ascii=False, indent=2))
-        sys.exit(0)
-
-    # 3. Download & Cache assets
-    pet_slug = name_en.lower().replace(" ", "-")
     char_cache = CACHE_DIR / f"pokemon_{dex}"
     char_cache.mkdir(parents=True, exist_ok=True)
-
     xml_file = fetch_file(dex, "AnimData.xml", char_cache)
     if not xml_file:
         res = {
@@ -623,50 +1014,99 @@ def main():
 
     anims = parse_anim_data(xml_file)
 
-    needed_sheets = ["Walk", "Idle", "Hop", "Hurt", "Pose", "Rotate", "Attack", "Charge", "Shock", "Shoot", "Strike", "Double", "Slam", "Float"]
+    if args.check_only:
+        has_head_sheet = "Head" in anims
+        res = {
+            "status": "AVAILABLE",
+            "pokemon": pokemon,
+            "hasDedicatedHeadSheet": has_head_sheet,
+            "supportedLookStyles": ["eyes", "head", "body", "all"],
+            "recommendedLookStyle": "head" if has_head_sheet else "eyes",
+            "message": f"SpriteCollab 拥有【{name_zh}】(#{dex} {name_en}) 的完整官方级逐帧动作素材（{'含独立 8 向 Head-Anim 头部素材' if has_head_sheet else '支持智能眼部与头部拆分追踪'}），可以随时生成！"
+        }
+        print(json.dumps(res, ensure_ascii=False, indent=2))
+        sys.exit(0)
+
+    # 3. Download & Cache assets
+    needed_sheets = ["Walk", "Idle", "Hop", "Hurt", "Pose", "Rotate", "Attack", "Charge", "Shock", "Shoot", "Strike", "Double", "Slam", "Float", "Head"]
     for s in needed_sheets:
         if s in anims or s in ["Walk", "Idle", "Hop", "Hurt", "Pose", "Rotate"]:
             fetch_file(dex, f"{s}-Anim.png", char_cache)
     if args.idle_style == "sleep" and "Sleep" in anims:
         fetch_file(dex, "Sleep-Anim.png", char_cache)
 
-    # 4. Assemble Atlas
-    atlas = assemble_pokemon_atlas(pokemon, char_cache, anims, user_scale_mult=args.scale_mult, idle_style=args.idle_style)
-    atlas = clean_alpha_residues(atlas)
-
-    # 5. Output and deploy
-    dest_dirs = []
-    if args.dest:
-        dest_dirs.append(Path(args.dest))
+    # 4. Build & deploy one or multiple look styles
+    base_slug = args.pet_id or name_en.lower().replace(" ", "-")
+    if args.look_style == "all":
+        variants = [
+            ("eyes", f"{base_slug}-eyes", f"{name_zh}-眼球追踪 ({name_en} Eyes)"),
+            ("head", f"{base_slug}-head", f"{name_zh}-头部追踪 ({name_en} Head)"),
+        ]
     else:
-        # Default deployment to Codex, CoPet User, and CoPet App Assets
-        dest_dirs.append(DEFAULT_PETS_DIR / pet_slug)
-        copet_user = Path(os.path.expanduser("~/.copet/pets")) / pet_slug
-        dest_dirs.append(copet_user)
-        copet_app = Path(os.path.expanduser("~/AppData/Local/CoPet/assets/pets")) / pet_slug
-        if copet_app.parent.exists():
-            dest_dirs.append(copet_app)
+        style_label_map = {
+            "eyes": f"{name_zh}-眼球追踪 ({name_en} Eyes)",
+            "head": f"{name_zh}-头部追踪 ({name_en} Head)",
+            "body": f"{name_zh} ({name_en})",
+        }
+        default_name = args.display_name or (f"{name_zh} ({name_en})" if args.pet_id is None else style_label_map[args.look_style])
+        variants = [(args.look_style, base_slug, default_name)]
 
-    pet_metadata = generate_pet_json(pokemon)
+    installed_packages = []
+    for style, slug, disp_name in variants:
+        atlas = assemble_pokemon_atlas(
+            pokemon,
+            char_cache,
+            anims,
+            user_scale_mult=args.scale_mult,
+            idle_style=args.idle_style,
+            look_style=style,
+        )
+        atlas = clean_alpha_residues(atlas)
 
-    for target_dir in dest_dirs:
-        target_dir.mkdir(parents=True, exist_ok=True)
-        atlas.save(target_dir / "spritesheet.png", "PNG")
-        atlas.save(target_dir / "spritesheet.webp", "WEBP", lossless=True, quality=100)
-        with open(target_dir / "pet.json", "w", encoding="utf-8") as f:
-            json.dump(pet_metadata, f, ensure_ascii=False, indent=2)
+        dest_dirs = []
+        if args.dest and len(variants) == 1:
+            dest_dirs.append(Path(args.dest))
+        elif args.dest:
+            dest_dirs.append(Path(args.dest) / slug)
+        else:
+            dest_dirs.append(DEFAULT_PETS_DIR / slug)
+            copet_user = Path(os.path.expanduser("~/.copet/pets")) / slug
+            dest_dirs.append(copet_user)
+            copet_app = Path(os.path.expanduser("~/AppData/Local/CoPet/assets/pets")) / slug
+            if copet_app.parent.exists():
+                dest_dirs.append(copet_app)
+
+        pet_metadata = generate_pet_json(pokemon, custom_id=slug, custom_name=disp_name)
+
+        for target_dir in dest_dirs:
+            target_dir.mkdir(parents=True, exist_ok=True)
+            atlas.save(target_dir / "spritesheet.png", "PNG")
+            atlas.save(target_dir / "spritesheet.webp", "WEBP", lossless=True, quality=100, exact=True)
+            with open(target_dir / "pet.json", "w", encoding="utf-8") as f:
+                json.dump(pet_metadata, f, ensure_ascii=False, indent=2)
+
+        installed_packages.append({
+            "petId": slug,
+            "name": disp_name,
+            "lookStyle": style,
+            "installPaths": [str(d) for d in dest_dirs],
+        })
 
     res = {
         "status": "SUCCESS",
         "pokemon": pokemon,
-        "petId": pet_slug,
-        "name": f"{name_zh} ({name_en})",
-        "installPaths": [str(d) for d in dest_dirs],
+        "packages": installed_packages,
+        "petId": installed_packages[0]["petId"],
+        "name": installed_packages[0]["name"],
+        "lookStyle": args.look_style,
+        "installPaths": [p for pkg in installed_packages for p in pkg["installPaths"]],
         "files": ["pet.json", "spritesheet.png", "spritesheet.webp"],
-        "message": f"🎉 成功为【{name_zh}】(#{dex} {name_en}) 生成官方逐帧 AI Agent 桌宠！已自动部署至 CoPet 及 Codex 桌宠目录。"
+        "message": f"🎉 成功为【{name_zh}】(#{dex} {name_en}) 生成 {len(installed_packages)} 款官方逐帧 AI Agent 桌宠（视线模式: {args.look_style}）！已自动部署至 CoPet 及 Codex 桌宠目录。"
     }
     print(json.dumps(res, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     main()
+
+
