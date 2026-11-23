@@ -83,10 +83,10 @@ python scripts/generate_pokemon_pet.py --query "<宝可梦名称或图鉴号>"
 生成图集完全符合以下技术规范并通过 `validate_atlas.py` 严格校验：
 - **尺寸规格**：`1536 × 2288` (8 列 × 11 行，单帧 `192 × 208` 像素)
 - **动作映射表 (73 独立帧 + 15 占位帧)**：
-  - Row 0: `idle` (6 帧, 自然呼吸起伏)
+  - Row 0: `idle` (6 帧, 默认静止站姿，不频繁晃动；可通过 `--idle-style static|sleep|breathe` 切换为打盹或微呼吸)
   - Row 1: `running-right` (8 帧, 经典右向迈步走)
   - Row 2: `running-left` (8 帧, 经典左向迈步走)
-  - Row 3: `waving` (4 帧, 招手欢呼与打招呼星光)
+  - Row 3: `waving` (4 帧, 鼠标点击/打招呼触发原 `Idle-Anim` 活跃动态与星光)
   - Row 4: `jumping` (5 帧, 下蹲蓄力 $\to$ 腾空滞空 $\to$ 下落冲击)
   - Row 5: `failed` (8 帧, 受击/眩晕/汗滴报错状态)
   - Row 6: `waiting` (6 帧, 探头张望等待用户输入)

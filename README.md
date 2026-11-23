@@ -64,6 +64,9 @@ python scripts/generate_pokemon_pet.py --query "eevee"
 # 生成耿鬼
 python scripts/generate_pokemon_pet.py --query 94
 
+# 可选待机姿态：static（默认静止站姿）、sleep（打盹）、breathe（微呼吸）
+python scripts/generate_pokemon_pet.py --query "皮卡丘" --idle-style sleep
+
 # 仅检查 SpriteCollab 是否收录某只宝可梦
 python scripts/generate_pokemon_pet.py --query "索财灵" --check-only
 ```

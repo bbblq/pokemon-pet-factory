@@ -59,7 +59,7 @@ LOOK_DIRECTION_LABELS = [
 ]
 
 ROW_CONFIG = [
-    {"row": 0, "state": "idle", "frames": 6, "durations": [280, 110, 110, 140, 140, 320]},
+    {"row": 0, "state": "idle", "frames": 6, "durations": [800, 800, 800, 800, 800, 800]},
     {"row": 1, "state": "running-right", "frames": 8, "durations": [120, 120, 120, 120, 120, 120, 120, 220]},
     {"row": 2, "state": "running-left", "frames": 8, "durations": [120, 120, 120, 120, 120, 120, 120, 220]},
     {"row": 3, "state": "waving", "frames": 4, "durations": [140, 140, 140, 280]},
@@ -289,7 +289,7 @@ def build_cell(raw_crop: Image.Image,
     return cell
 
 
-def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale_mult: float = 1.0):
+def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale_mult: float = 1.0, idle_style: str = "static"):
     atlas = Image.new("RGBA", (ATLAS_WIDTH, ATLAS_HEIGHT), (0, 0, 0, 0))
 
     # Helper to load animation sheets
@@ -299,6 +299,7 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
 
     walk_sheet = load_sheet("Walk")
     idle_sheet = load_sheet("Idle") or walk_sheet
+    sleep_sheet = load_sheet("Sleep") or idle_sheet
     hop_sheet = load_sheet("Hop") or walk_sheet
     hurt_sheet = load_sheet("Hurt") or load_sheet("Pain") or load_sheet("Faint") or walk_sheet
     pose_sheet = load_sheet("Pose") or load_sheet("Nod") or hop_sheet
@@ -334,16 +335,27 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
         return crop_frame(sheet, safe_col, safe_row, fw, fh)
 
     # ----------------------------------------------------
-    # Row 0: Idle (6 frames, facing South / row 0)
+    # Row 0: Idle (6 frames, calm by default)
     # ----------------------------------------------------
     idle_info = anims.get("Idle", walk_info)
-    idle_frames = idle_info["frames"]
-    for c in range(6):
-        raw = get_frame(idle_sheet, "Idle", c % idle_frames, 0)
-        # Subtle organic breathing motion
-        b_lift = int(math.sin(c / 6.0 * math.pi * 2) * 2)
-        cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=b_lift)
-        atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
+    idle_frames = max(1, idle_info["frames"])
+    if idle_style == "sleep" and "Sleep" in anims and sleep_sheet is not None:
+        sleep_frames = max(1, anims["Sleep"]["frames"])
+        for c in range(6):
+            raw = get_frame(sleep_sheet, "Sleep", (c // 3) % sleep_frames, 0)
+            cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=0)
+            atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
+    elif idle_style == "breathe":
+        breathe_lifts = [0, 0, 1, 1, 0, 0]
+        raw = get_frame(idle_sheet, "Idle", 0, 0)
+        for c in range(6):
+            cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=breathe_lifts[c])
+            atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
+    else:
+        raw = get_frame(idle_sheet, "Idle", 0, 0)
+        for c in range(6):
+            cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=0)
+            atlas.paste(cell, (c * CELL_WIDTH, 0 * CELL_HEIGHT), cell)
 
     # ----------------------------------------------------
     # Row 1: Running-Right (8 frames, facing East / row 2)
@@ -364,12 +376,14 @@ def assemble_pokemon_atlas(pokemon: dict, src_dir: Path, anims: dict, user_scale
         atlas.paste(cell, (c * CELL_WIDTH, 2 * CELL_HEIGHT), cell)
 
     # ----------------------------------------------------
-    # Row 3: Waving (4 frames, greeting / celebratory pose)
+    # Row 3: Waving (4 frames, mouse-click / greeting trigger using active Idle-Anim)
     # ----------------------------------------------------
     for c in range(4):
-        raw = get_frame(pose_sheet, "Pose" if "Pose" in anims else "Hop", c, 0)
+        frame_idx = int(c * idle_frames / 4) % idle_frames
+        raw = get_frame(idle_sheet, "Idle", frame_idx, 0)
+        b_lift = int(math.sin(c / 4.0 * math.pi * 2) * 2)
         acc = "sparkle" if c in [1, 2] else None
-        cell = build_cell(raw, scale=scale, baseline_y=baseline, shift_x=(c % 2) * 2, accessory=acc)
+        cell = build_cell(raw, scale=scale, baseline_y=baseline, lift_y=b_lift, accessory=acc)
         atlas.paste(cell, (c * CELL_WIDTH, 3 * CELL_HEIGHT), cell)
 
     # ----------------------------------------------------
@@ -549,6 +563,12 @@ def main():
     parser.add_argument("--check-only", action="store_true", help="Only check if available in SpriteCollab, do not build")
     parser.add_argument("--dest", "-d", default=None, help="Destination directory for pet (defaults to ~/.codex/pets/<id>)")
     parser.add_argument("--scale-mult", type=float, default=1.0, help="Scale multiplier for character size (default: 1.0)")
+    parser.add_argument(
+        "--idle-style",
+        choices=["static", "sleep", "breathe"],
+        default="static",
+        help="Idle animation style: static (standing still, default), sleep (Sleep-Anim), or breathe (subtle 1px lift)"
+    )
     args = parser.parse_args()
 
     # 1. Look up in Pokédex DB
@@ -607,9 +627,11 @@ def main():
     for s in needed_sheets:
         if s in anims or s in ["Walk", "Idle", "Hop", "Hurt", "Pose", "Rotate"]:
             fetch_file(dex, f"{s}-Anim.png", char_cache)
+    if args.idle_style == "sleep" and "Sleep" in anims:
+        fetch_file(dex, "Sleep-Anim.png", char_cache)
 
     # 4. Assemble Atlas
-    atlas = assemble_pokemon_atlas(pokemon, char_cache, anims, user_scale_mult=args.scale_mult)
+    atlas = assemble_pokemon_atlas(pokemon, char_cache, anims, user_scale_mult=args.scale_mult, idle_style=args.idle_style)
     atlas = clean_alpha_residues(atlas)
 
     # 5. Output and deploy
